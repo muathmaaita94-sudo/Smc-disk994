@@ -1,18 +1,19 @@
-"""SMC DESK - Python port of SMC_ICT_MultiStrategy_EA (EMA80 v2) as a 6-agent swarm.
-  python app.py                        -> paper mode on simulated data (works anywhere)
-  python app.py --live --symbol BTCUSDm -> real MetaTrader5 terminal (Windows)
-  python app.py --binance --symbol BTCUSDT -> real Binance data (works anywhere)
-Then open http://localhost:8000"""
-import argparse, asyncio, json, math, threading, time
+"""SMC DESK - Python port of SMC_ICT_MultiStrategy_EA (EMA80 v2) as a 6-agent swarm. Single file: the UI is embedded.
+  python app.py                          -> SCALP mode, paper trading on REAL prices (Yahoo Finance); falls back to simulation if blocked
+  python app.py --mode swing             -> original EA timeframes (D1/H4/H1, one decision per H1 bar)
+  python app.py --data sim               -> simulated prices
+  python app.py --live --symbol BTCUSDm  -> real MetaTrader5 terminal (Windows only)
+Open http://localhost:8000. On Render the PORT variable is used automatically.
+Optional login for a public URL: set the environment variable DESK_PASSWORD (any username)."""
+import argparse, asyncio, base64, hashlib, json, math, os, threading, time, urllib.request
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import numpy as np, pandas as pd
-import requests
 
 @dataclass
 class Cfg:  # same inputs as the EA (distances in points, converted with feed.point)
-    symbol: str = "BTCUSDT"; live: bool = False; binance: bool = False; magic: int = 20260719; sim_speed: int = 5
+    symbol: str = "BTCUSD"; data: str = "yahoo"; live: bool = False; magic: int = 20260719; sim_speed: int = 5
     risk_pct: float = 0.5; max_total_risk: float = 1.5; max_trades: int = 2
     min_dist_pts: float = 800; max_spread_pts: float = 300
     atr_n: int = 14; atr_sl: float = 2.5; rr: float = 3.5
@@ -24,6 +25,13 @@ class Cfg:  # same inputs as the EA (distances in points, converted with feed.po
     e80_align: int = 15; e80_counter: int = 18; e80_allow_counter: bool = False; e80_counter_min: int = 80
     daily_limit: float = 3.0; max_dd: float = 10.0; emergency_dd: float = 15.0; dd_cooldown_h: int = 24
     recovery_losses: int = 3; recovery_mult: float = 0.5; hours: tuple = (0, 24)
+    mode: str = "scalp"; tf_trend: str = "D1"; tf_signal: str = "H4"; tf_entry: str = "H1"; trigger: str = "H1"; max_hold_min: int = 0; min_dist_atr: float = 0.0
+
+PROFILES = {"scalp": dict(tf_trend="H4", tf_signal="H1", tf_entry="M5", trigger="M1", atr_sl=1.5, rr=1.2, light_rr=0.9,
+                          max_trades=3, risk_pct=0.3, max_total_risk=1.2, p1=(60, 0), p2=(90, 0), be_trigger=50, trail_start=60,
+                          trail_atr=0.8, min_score=60, full_score=80, light_score=50, max_hold_min=20, min_dist_atr=0.5),
+            "swing": {}}
+def apply_profile(c): return replace(c, **PROFILES.get(c.mode, {}))
 
 # ---------------------------------------------------------------- indicators
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -49,7 +57,7 @@ class SimFeed:
         s.df.loc[s.df.index[-1] + pd.Timedelta(minutes=1)] = [l.close, max(l.close, c)+w[0], min(l.close, c)-w[1], c]
     def rates(s, tf, n):
         if tf == "M1": return s.df.tail(n)
-        return s.df.resample({"H1": "1h", "H4": "4h", "D1": "1D"}[tf]).agg(
+        return s.df.resample({"M5": "5min", "H1": "1h", "H4": "4h", "D1": "1D"}[tf]).agg(
             {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna().tail(n)
     def tick(s): b = float(s.df.close.iloc[-1]); return b, b + 30*s.point
     def spread(s): return 30
@@ -65,59 +73,60 @@ class MT5Feed:
         s.contract = i.trade_tick_value/i.trade_tick_size       # money per 1.0 price move per 1 lot
     def step(s): pass
     def rates(s, tf, n):
-        m = s.m; c = {"M1": m.TIMEFRAME_M1, "H1": m.TIMEFRAME_H1, "H4": m.TIMEFRAME_H4, "D1": m.TIMEFRAME_D1}[tf]
+        m = s.m; c = {"M1": m.TIMEFRAME_M1, "M5": m.TIMEFRAME_M5, "H1": m.TIMEFRAME_H1, "H4": m.TIMEFRAME_H4, "D1": m.TIMEFRAME_D1}[tf]
         d = pd.DataFrame(m.copy_rates_from_pos(s.sym, c, 0, n)); d.index = pd.to_datetime(d.time, unit="s"); return d
     def tick(s): t = s.m.symbol_info_tick(s.sym); return t.bid, t.ask
     def spread(s): return s.m.symbol_info(s.sym).spread
     def now(s): return pd.Timestamp(s.m.symbol_info_tick(s.sym).time, unit="s")
 
-class BinanceFeed:
-    point, contract, vmin, vmax, vstep = 0.01, 1.0, 0.001, 100.0, 0.001
-    def __init__(s, symbol="BTCUSDT"):
-        s.sym = symbol.upper()
-        s._update_rates()
-    def _update_rates(s):
-        url = f"https://api.binance.com/api/v3/klines?symbol={s.sym}&interval=1m&limit=500"
-        res = requests.get(url).json()
-        df = pd.DataFrame(res, columns=[
-            'time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ])
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        s.df = df.set_index('time')
-    def step(s):
-        try:
-            s._update_rates()
-        except Exception:
-            pass
+def nd(p): return 5 if p < 10 else 3 if p < 1000 else 2       # price decimals
+
+YMAP = {"BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD", "SOLUSD": "SOL-USD", "BNBUSD": "BNB-USD", "XRPUSD": "XRP-USD",
+        "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
+        "USDCAD": "USDCAD=X", "USDCHF": "USDCHF=X", "XAUUSD": "XAUUSD=X"}
+YF = {"XAUUSD": "GC=F"}      # fallback only: gold FUTURES trade ~$20 above spot
+def _yahoo(sym, interval, rng):
+    req = urllib.request.Request(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={rng}",
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    r = json.load(urllib.request.urlopen(req, timeout=8))["chart"]["result"][0]; q = r["indicators"]["quote"][0]
+    return pd.DataFrame({k: q[k] for k in ("open", "high", "low", "close")}, index=pd.to_datetime(r["timestamp"], unit="s")).dropna()
+
+class LiveFeed:    # REAL market prices (crypto + forex + gold) from Yahoo Finance, no API key
+    TTL = {"M1": ("1m", "5d", 10), "M5": ("5m", "5d", 20), "H1": ("60m", "60d", 90), "D1": ("1d", "1y", 1800)}   # (interval, range, refresh seconds)
+    def __init__(s, sym):
+        s.sym, s.err = sym, ""
+        for y in [YMAP[sym]] + ([YF[sym]] if sym in YF else []):      # spot symbol first, then fallback
+            s.y, s.d, s.t = y, {}, {}
+            try: s.refresh(True); break
+            except Exception as e: last = e
+        else: raise last
+        p = float(s.d["M1"].close.iloc[-1]); s.crypto = sym[:3] in ("BTC", "ETH", "SOL", "BNB", "XRP"); s.vmax = 50.0
+        if s.crypto:
+            s.point = 10**math.floor(math.log10(p))/1e4; s.vmin = 0.001 if p > 10000 else 0.01
+            s.max_spread_pts, s.min_dist_pts, s.spr = 300, p*0.003/s.point, p*0.0003/s.point
+        elif sym == "XAUUSD": s.point, s.vmin, s.max_spread_pts, s.min_dist_pts, s.spr = 0.01, 0.01, 100, 800, 30
+        else: s.point, s.vmin, s.max_spread_pts, s.min_dist_pts, s.spr = (0.001 if sym.endswith("JPY") else 0.00001), 0.01, 50, 200, 8
+        s.vstep = s.vmin
+    @property
+    def contract(s):     # money per 1.0 price move per 1 lot (approximation, USD account)
+        p = float(s.d["M1"].close.iloc[-1])
+        return 1.0 if s.crypto else 100.0 if s.sym == "XAUUSD" else 100000/p if s.sym.startswith("USD") else 100000.0
+    def refresh(s, force=False):
+        now = time.time()
+        for k, (iv, rg, ttl) in s.TTL.items():
+            if force or now-s.t.get(k, 0) >= ttl:
+                try: s.d[k] = _yahoo(s.y, iv, rg); s.t[k] = now; s.err = ""
+                except Exception as e:
+                    s.err = type(e).__name__; s.t[k] = now-ttl+20
+                    if k not in s.d: raise RuntimeError(f"cannot fetch {s.sym} ({s.err}: {e})")
+    def step(s): s.refresh()
     def rates(s, tf, n):
-        interval_map = {"M1": "1m", "H1": "1h", "H4": "4h", "D1": "1d"}
-        if tf != "M1":
-            try:
-                url = f"https://api.binance.com/api/v3/klines?symbol={s.sym}&interval={interval_map.get(tf, '1h')}&limit={n}"
-                res = requests.get(url).json()
-                df = pd.DataFrame(res, columns=['time', 'open', 'high', 'low', 'close', 'volume', *_[:6]])
-                df['time'] = pd.to_datetime(df['time'], unit='ms')
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
-                return df.set_index('time').tail(n)
-            except Exception:
-                pass
-        return s.df.tail(n)
-    def tick(s):
-        try:
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={s.sym}"
-            res = requests.get(url).json()
-            px = float(res['price'])
-            return px, px + 0.5
-        except Exception:
-            px = float(s.df.close.iloc[-1])
-            return px, px + 0.5
-    def spread(s): return 10
-    def now(s): return s.df.index[-1]
+        if tf == "H4": return s.d["H1"].resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna().tail(n)
+        return s.d[tf].tail(n)
+    def tick(s): b = float(s.d["M1"].close.iloc[-1]); return b, b+s.spr*s.point
+    def spread(s): return int(s.spr)
+    def now(s): return s.d["M1"].index[-1]
+    def is_open(s): return (pd.Timestamp.now("UTC").tz_localize(None)-s.d["M1"].index[-1]).total_seconds() < 1200
 
 # ---------------------------------------------------------------- brokers (same interface)
 class Paper:
@@ -164,10 +173,10 @@ class Live:
         s.m.order_send(dict(action=s.m.TRADE_ACTION_SLTP, position=id, symbol=s.f.sym, sl=sl, tp=p["tp"]))
     def close(s, id, vol=None, px=None):
         m = s.m; p = next(p for p in s.positions() if p["id"] == id); b, a = s.f.tick()
-        m.order_send(dict(action=s.m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
-                          magic=s.magic, type=s.m.ORDER_TYPE_SELL if p["dir"] == 1 else s.m.ORDER_TYPE_BUY,
-                          price=b if p["dir"] == 1 else a, type_filling=s.m.ORDER_FILLING_IOC))
-    def check_stops(s):
+        m.order_send(dict(action=m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
+                          magic=s.magic, type=m.ORDER_TYPE_SELL if p["dir"] == 1 else m.ORDER_TYPE_BUY,
+                          price=b if p["dir"] == 1 else a, type_filling=m.ORDER_FILLING_IOC))
+    def check_stops(s):       # every exit deal (SL/TP/partial/manual), same as the EA's OnTradeTransaction
         m, out = s.m, []
         for d in m.history_deals_get(s.t0.to_pydatetime(), (pd.Timestamp.now()+pd.Timedelta(days=1)).to_pydatetime()) or []:
             if d.magic == s.magic and d.entry == m.DEAL_ENTRY_OUT and d.ticket not in s.seen:
@@ -185,16 +194,8 @@ class Agent:
 
 class Engine:
     def __init__(s, cfg):
-        s.c = cfg
-        if cfg.binance:
-            s.feed = BinanceFeed(cfg.symbol)
-            s.br = Paper(s.feed)
-        elif cfg.live:
-            s.feed = MT5Feed(cfg.symbol)
-            s.br = Live(s.feed, cfg.magic)
-        else:
-            s.feed = SimFeed()
-            s.br = Paper(s.feed)
+        s.base = cfg; s.c = cfg = apply_profile(cfg); s.feed = MT5Feed(cfg.symbol) if cfg.live else LiveFeed(cfg.symbol) if cfg.data == "yahoo" else SimFeed()
+        s.br = Live(s.feed, cfg.magic) if cfg.live else Paper(s.feed)
         s.ag = {k: Agent(k, n, r, col) for k, n, r, col in AGENTS}
         s.logs, s.tickets, s.events, s.tk, s.flags, s.eq = deque(maxlen=80), deque(maxlen=40), deque(maxlen=30), {}, {}, deque(maxlen=300)
         s.enabled, s.last_bar, s.ctx, s.halt, s.cool, s.day, s.atr, s.eid, s.losses, s.dd = True, None, {}, "", None, None, 0.0, 0, 0, 0.0
@@ -209,7 +210,8 @@ class Engine:
         rec = s.br.close(id, vol)
         if rec: s.on_close(rec, why)
     def on_close(s, rec, why=""):
-        st, pnl = s.stats, rec["pnl"]; st["n"] += 1
+        st, pnl = s.stats, rec["pnl"]; st["n"] += 1; st["best"] = max(st.get("best", 0), pnl); st["worst"] = min(st.get("worst", 0), pnl)
+        k = st.get("streak", 0); st["streak"] = ((k+1 if k > 0 else 1) if pnl >= 0 else (k-1 if k < 0 else -1))
         if pnl >= 0: st["w"] += 1; st["gp"] += pnl; s.losses = 0
         else: st["gl"] += pnl; s.losses += 1
         t = s.tk.get(rec["id"])
@@ -218,8 +220,9 @@ class Engine:
             if rec["id"] not in {p["id"] for p in s.br.positions()}: t["status"] = "WIN" if t["pnl"] >= 0 else "LOSS"
         s.event("close", f"{'WIN' if pnl >= 0 else 'LOSS'} {pnl:+,.0f}$", pnl=pnl)
         s.say(s.ag["closer"], f"exit #{rec['id']} {pnl:+.2f}$ {why}", f"exit #{rec['id']} {pnl:+,.2f}$ {why}", "win" if pnl >= 0 else "loss")
+    # -- one decision cycle: Closer(risk) -> Spotter -> Prior -> Edge -> Kelly -> Taker -> Closer(manage)
     def tick(s):
-        for _ in range(1 if (s.c.live or s.c.binance) else s.c.sim_speed): s.feed.step()
+        for _ in range(1 if s.c.live else s.c.sim_speed): s.feed.step()
         s.ctx = dict(b=0, s=0, facts={})
         for r in s.br.check_stops(): s.on_close(r, "SL/TP")
         s.closer_risk(); s.closer_manage()
@@ -227,7 +230,7 @@ class Engine:
         s.eq.append(round(s.br.equity(), 2))
 
     def spotter(s):
-        x, f = s.ctx, s.feed; d1 = f.rates("D1", 80).close; h4 = f.rates("H4", 120).close; h1 = f.rates("H1", 200)
+        c = s.c; x, f = s.ctx, s.feed; d1 = f.rates(c.tf_trend, 80).close; h4 = f.rates(c.tf_signal, 120).close; h1 = f.rates(c.tf_entry, 200)
         sma = d1.rolling(50).mean().iloc[-2]
         tr = 0 if np.isnan(sma) else int(np.sign(d1.iloc[-2]-sma))
         ma = int(np.sign(ema(h4, 9).iloc[-2]-ema(h4, 21).iloc[-2])); r = float(rsi(h4).iloc[-2])
@@ -235,12 +238,12 @@ class Engine:
         x["b"] += 25*(tr == 1)+20*(ma == 1)+15*(30 <= r <= 60)+15*(cd == 1)
         x["s"] += 25*(tr == -1)+20*(ma == -1)+15*(40 <= r <= 70)+15*(cd == -1)
         x["h1"] = h1; x["facts"].update(trend=tr, ma=ma, rsi=round(r, 1), candle=cd)
-        s.say(s.ag["spotter"], f"D1 {SG[tr]} · H4 MA {SG[ma]} · RSI {r:.0f} · H1 {SG[cd]}", f"tape D1 {SG[tr]} / H4 {SG[ma]} / candle {SG[cd]}")
+        s.say(s.ag["spotter"], f"{c.tf_trend} {SG[tr]} · {c.tf_signal} MA {SG[ma]} · RSI {r:.0f} · {c.tf_entry} {SG[cd]}", f"tape {c.tf_trend} {SG[tr]} / {c.tf_signal} {SG[ma]} / candle {SG[cd]}")
 
     def prior(s):
         c, x = s.c, s.ctx; h1 = x["h1"]; a = float(atr(h1, c.atr_n).iloc[-2]); s.atr = x["atr"] = a
-        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))
-        px, z = cl[1], c.sr_zone_pts*s.feed.point
+        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))   # index k = shift k
+        px, z = cl[1], (0.5*a if c.mode == "scalp" else c.sr_zone_pts*s.feed.point)
         res, sup = h[1:c.sr_lookback+1].max(), l[1:c.sr_lookback+1].min(); ob = fvg = 0
         for i in range(2, 20):
             lo, hi = min(o[i+1], cl[i+1]), max(o[i+1], cl[i+1])
@@ -273,7 +276,7 @@ class Engine:
             elif score < c.e80_counter_min: d, note = 0, "EMA80 counter score too low"
         tier = "FULL" if score >= c.full_score else "STANDARD" if score >= c.min_score else "LIGHT" if score >= c.light_score else ""
         x.update(dir=d, score=score, tier=tier, bias=bias, strength=round(st), note=note, buy=b, sell=sc, slope_atr=round(sa, 2), dist_atr=round(da, 2),
-                 chart=dict(p=m1.close.tail(120).round(2).tolist(), e=e.tail(120).round(2).tolist()))
+                 chart=dict(p=m1.close.tail(120).round(6).tolist(), e=e.tail(120).round(6).tolist()))
         s.say(s.ag["edge"], f"EMA80 {DN[bias] if bias else 'NEUTRAL'} {st:.0f}/100 → {DN[d]} {score} {tier}",
               f"EMA80 {DN[bias] if bias else 'NEUTRAL'} · signal {DN[d]} {tier or '-'}" + (f" · {note}" if note else ""),
               "signal" if d and tier else "info")
@@ -292,19 +295,20 @@ class Engine:
             if f.vmin*per_lot/bal*100 > risk: x["block"] = "min lot exceeds risk budget"; return s.say(A, x["block"], x["block"], "warn")
             lot = f.vmin
         lot = min(lot, f.vmax)
-        x["plan"] = dict(dir=d, lot=lot, entry=px, sl=round(px-d*slp, 2), tp=round(px+d*tpd, 2), rr=round(tpd/slp, 2), risk=round(risk, 2))
+        x["plan"] = dict(dir=d, lot=lot, entry=px, sl=round(px-d*slp, nd(px)), tp=round(px+d*tpd, nd(px)), rr=round(tpd/slp, 2), risk=round(risk, 2))
         s.say(A, f"{DN[d]} {lot} lot · risk {risk:.2f}% · RR {tpd/slp:.1f}" + (" · recovery" if s.losses >= c.recovery_losses else ""))
 
     def taker(s):
-        c, x, f = s.c, s.ctx, s.feed; A = s.ag["taker"]; bar = x["h1"].index[-1]
-        if bar == s.last_bar: return s.say(A, "waiting for new H1 bar")
+        c, x, f = s.c, s.ctx, s.feed; A = s.ag["taker"]; bar = f.rates(c.trigger, 2).index[-1]
+        if bar == s.last_bar: return s.say(A, f"waiting for next {c.trigger} bar")
         s.last_bar = bar; pos = s.br.positions(); plan = x["plan"]; d = x["dir"]
         if not d or not x["tier"]: return s.say(A, f"no entry · score {x['score']} · {x['note'] or 'below light threshold'}")
-        why = (s.halt or ("trading paused" if not s.enabled else "") or
+        why = (s.halt or ("trading paused" if not s.enabled else "") or ("market closed" if not getattr(f, "is_open", lambda: True)() else "") or
                ("outside trading hours" if not c.hours[0] <= f.now().hour < c.hours[1] else "") or
-               ("spread too high" if f.spread() > c.max_spread_pts else "") or
+               ("spread too high" if f.spread() > getattr(f, "max_spread_pts", c.max_spread_pts) else "") or
+               ("spread eats the scalp" if plan and c.mode == "scalp" and (f.tick()[1]-f.tick()[0]) > 0.25*abs(plan["entry"]-plan["sl"]) else "") or
                ("max open trades" if len(pos) >= c.max_trades else "") or (x.get("block", "") if not plan else "") or
-               ("too close to open trade" if plan and any(abs(p["entry"]-plan["entry"]) < c.min_dist_pts*f.point for p in pos) else ""))
+               ("too close to open trade" if plan and any(abs(p["entry"]-plan["entry"]) < (c.min_dist_atr*x["atr"] if c.min_dist_atr else getattr(f, "min_dist_pts", c.min_dist_pts)*f.point) for p in pos) else ""))
         t = dict(dir=d, tier=x["tier"], score=x["score"], bias=x["bias"], t=str(f.now()), pnl=0.0, sl=0, tp=0, lot=0, entry=0,
                  trail={k: a.msg for k, a in s.ag.items() if k != "closer"})
         if not why:
@@ -315,7 +319,7 @@ class Engine:
             return s.say(A, f"blocked: {why}", f"{DN[d]} blocked: {why}", "warn")
         t.update(id=id, status="OPEN", lot=plan["lot"], entry=plan["entry"], sl=plan["sl"], tp=plan["tp"], rr=plan["rr"])
         s.tickets.appendleft(t); s.tk[id] = t; s.event("open", f"{DN[d]} {plan['lot']}", dir=d)
-        s.say(A, f"{DN[d]} #{id} filled @ {plan['entry']:,.2f}", f"{DN[d]} #{id} {x['tier']} filled @ {plan['entry']:,.2f}", "trade")
+        s.say(A, f"{DN[d]} #{id} filled @ {plan['entry']:,.{nd(plan['entry'])}f}", f"{DN[d]} #{id} {x['tier']} filled @ {plan['entry']:,.{nd(plan['entry'])}f}", "trade")
 
     def closer_risk(s):
         c, br = s.c, s.br; eq = br.equity(); now = s.feed.now(); s.peak = max(s.peak, eq)
@@ -336,6 +340,7 @@ class Engine:
         for p in s.br.positions():
             fl = s.flags.setdefault(p["id"], dict(v0=p["vol"], e=p["entry"], tp=p["tp"], p1=0, p2=0, be=0)); d = p["dir"]; sl = p["sl"]
             px = b if d == 1 else a
+            if c.max_hold_min and (f.now()-pd.Timestamp(p["t"])).total_seconds() >= c.max_hold_min*60: s.close(p["id"], None, "time stop"); continue
             if not fl["tp"] or (px-fl["e"])*d <= 0: continue
             prog = abs(px-fl["e"])/abs(fl["tp"]-fl["e"])*100; n += 1
             for k, (trg, pc) in (("p1", c.p1), ("p2", c.p2)):
@@ -343,10 +348,10 @@ class Engine:
                 if not fl[k] and prog >= trg and f.vmin <= v < p["vol"]: s.close(p["id"], v, f"partial {trg}%"); fl[k] = 1
             if not fl["be"] and prog >= c.be_trigger:
                 nsl = fl["e"]+d*c.be_off_pts*f.point
-                if not sl or (nsl-sl)*d > 0: s.br.modify(p["id"], round(nsl, 2)); sl = nsl; fl["be"] = 1
+                if not sl or (nsl-sl)*d > 0: s.br.modify(p["id"], round(nsl, nd(nsl))); sl = nsl; fl["be"] = 1
                 s.say(s.ag["closer"], f"#{p['id']} breakeven", f"#{p['id']} moved to breakeven", "info")
             if s.atr and prog >= c.trail_start:
-                nsl = round(px-d*s.atr*c.trail_atr, 2)
+                nsl = round(px-d*s.atr*c.trail_atr, nd(px))
                 if not sl or (nsl-sl)*d > 0: s.br.modify(p["id"], nsl)
         s.say(s.ag["closer"], f"{len(s.br.positions())} open · DD {s.dd:.1f}% · {s.halt or 'limits ok'}")
 
@@ -355,13 +360,13 @@ class Engine:
         for t in s.tickets:
             if t["status"] == "OPEN" and t["id"] in pnl: t["live"] = round(pnl[t["id"]], 2)
         b, a = s.feed.tick(); eq = s.br.equity()
-        return dict(mode="LIVE" if (s.c.live or s.c.binance) else "PAPER", symbol=s.c.symbol, time=str(s.feed.now()), price=b,
+        return dict(mode="LIVE" if s.c.live else "PAPER", symbol=s.c.symbol, src="MT5" if s.c.live else f"YAHOO · {s.feed.y}" if isinstance(s.feed, LiveFeed) else "SIMULATED DATA", market_open=getattr(s.feed, "is_open", lambda: True)(), err=getattr(s.feed, "err", ""), symbols=list(YMAP), tfs=[s.c.tf_trend, s.c.tf_signal, s.c.tf_entry], smode=s.c.mode, time=str(s.feed.now()), price=b,
                     enabled=s.enabled, halt=s.halt, equity=round(eq, 2), balance=round(s.br.balance(), 2), dd=round(s.dd, 2),
                     agents=[dict(key=a.key, name=a.name, role=a.role, color=a.color, msg=a.msg, age=round(now-a.pulse, 1)) for a in s.ag.values()],
                     sig={k: x.get(k) for k in ("dir", "score", "tier", "bias", "strength", "note", "buy", "sell", "slope_atr", "dist_atr", "facts", "plan")},
                     positions=pos, tickets=list(s.tickets), logs=list(s.logs)[:40], events=list(s.events), eq=list(s.eq), chart=x.get("chart"),
                     stats=dict(n=st["n"], wr=round(st["w"]/st["n"]*100, 1) if st["n"] else 0, pf=round(abs(st["gp"]/st["gl"]), 2) if st["gl"] else 0,
-                               maxdd=round(st["maxdd"], 2), pnl=round(st["gp"]+st["gl"], 2)))
+                               maxdd=round(st["maxdd"], 2), pnl=round(st["gp"]+st["gl"], 2), best=round(st.get("best", 0), 2), worst=round(st.get("worst", 0), 2), streak=st.get("streak", 0), day=round(s.br.balance()-s.day_bal, 2)))
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -375,7 +380,7 @@ header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;padding:8px 1
 .logo{display:flex;align-items:center;gap:8px;font:700 17px system-ui}.logo i{width:22px;height:22px;border-radius:50%;background:#fff;position:relative}
 .logo i:after{content:'';position:absolute;left:7px;top:6px;width:3px;height:9px;background:#000;border-radius:2px;box-shadow:6px 0 #000}.logo b{color:var(--mut);font-weight:400}
 .sp{flex:1}.clk{font:700 24px system-ui;letter-spacing:1px}
-button{cursor:pointer;background:none;font:inherit;color:var(--g);padding:5px 10px;border-radius:6px;border:1px solid var(--g);font-size:9px;letter-spacing:1px}button.off{color:var(--r);border-color:var(--r)}
+select{background:#0b1018;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:700 13px system-ui}button{cursor:pointer;background:none;font:inherit;color:var(--g);padding:5px 10px;border-radius:6px;border:1px solid var(--g);font-size:9px;letter-spacing:1px}button.off{color:var(--r);border-color:var(--r)}
 #strip{display:flex;flex-wrap:wrap;gap:4px 18px;padding:6px 4px;font-size:9px;color:var(--mut);letter-spacing:.8px}#strip b{color:var(--tx)}#strip .live{color:var(--g);border:1px solid #14533f;padding:0 6px;border-radius:3px}
 #agents{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin:4px 0 8px}
 .ag{border:1px solid var(--line);background:var(--card);border-radius:6px;padding:8px;min-width:0;transition:.3s}.ag.now{border-color:var(--c);box-shadow:0 0 14px -6px var(--c)}
@@ -396,7 +401,8 @@ canvas{width:100%;display:block}#hub{border-radius:6px}
 </style></head><body>
 <header>
  <div class="logo"><i></i>SMC <b>DESK</b></div>
- <div><div class="k">Symbol</div><div class="v" id="sym">-</div></div>
+ <div><div class="k">Symbol</div><select id="symsel"></select></div>
+ <div><div class="k">Mode</div><select id="modesel"><option value="scalp">SCALP</option><option value="swing">SWING</option></select></div>
  <div><div class="k">Price</div><div class="v" id="px">-</div></div>
  <div><div class="k">Equity</div><div class="v" id="eq">-</div></div>
  <div><div class="k">Drawdown</div><div class="v" id="dd">-</div></div>
@@ -414,7 +420,7 @@ canvas{width:100%;display:block}#hub{border-radius:6px}
 </div>
 <div class="cols3">
  <div class="card"><h4><span>◆ SWARM PNL · one book, six agents</span><span class="up">LIVE</span></h4><div class="k" id="mode">PAPER</div><div class="big" id="pn">$0</div><div class="k" id="pns"></div></div>
- <div class="card"><h4><span>◆ BTC / USD · M1 + EMA80</span><span id="bias"></span></h4><div class="v" id="px2"></div><canvas id="c1" height="110"></canvas></div>
+ <div class="card"><h4><span><span id="c1t"></span></span><span id="bias"></span></h4><div class="v" id="px2"></div><canvas id="c1" height="110"></canvas></div>
  <div class="card"><h4><span>◆ BAYESIAN UPDATE · buy vs sell</span><span id="bay"></span></h4><canvas id="c3" height="130"></canvas></div>
 </div>
 <div class="cols3">
@@ -423,36 +429,37 @@ canvas{width:100%;display:block}#hub{border-radius:6px}
  <div class="card"><h4><span>◆ SIGNAL SPECTROGRAM</span></h4><canvas id="c4" height="120"></canvas></div>
 </div>
 <script>
-const $=i=>document.getElementById(i),f2=n=>(+n).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}),SG={1:'▲',[-1]:'▼',0:'•'},DN={1:'BUY',[-1]:'SELL',0:'—'};
-let S=null,lastEv=0,floats=[],eq0=null,hist=[],sound=false,AC=null,pk=[];
+const $=i=>document.getElementById(i),f2=n=>(+n).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}),pf=n=>(+n).toFixed(n<10?5:n<1000?3:2),SG={1:'▲',[-1]:'▼',0:'•'},DN={1:'BUY',[-1]:'SELL',0:'—'};
+let curSym='',S=null,lastEv=0,floats=[],eq0=null,hist=[],sound=false,AC=null,pk=[];
 const SH={circle:'M12 2a10 10 0 1 0 .01 0z',tri:'M12 3 21.5 20H2.5z',drop:'M12 2C12 2 19.5 10.5 19.5 15.5a7.5 7.5 0 0 1-15 0C4.5 10.5 12 2 12 2z'},P2={};for(const k in SH)P2[k]=new Path2D(SH[k]);
 const POS=[[.30,.36,'circle'],[.055,.52,'circle'],[.30,.72,'tri'],[.70,.36,'drop'],[.945,.52,'circle'],[.70,.72,'circle']],STEP=['01 · TAPE','02 · STRUCTURE','03 · EDGE','04 · SIZING','05 · EXECUTION','06 · SETTLEMENT'];
 const svg=(c,s)=>`<svg viewBox="0 0 24 24" width="26" height="26"><path d="${SH[s]}" fill="${c}"/><path d="M8.6 11.5l1 3M15.4 11.5l-1 3" stroke="#fff" stroke-width="1.7" stroke-linecap="round"/></svg>`;
 function beep(f,d,t0){if(!sound)return;try{AC=AC||new (window.AudioContext||window.webkitAudioContext)();const o=AC.createOscillator(),g=AC.createGain();o.frequency.value=f;o.type='sine';o.connect(g);g.connect(AC.destination);const t=AC.currentTime+(t0||0);g.gain.setValueAtTime(.07,t);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.start(t);o.stop(t+d)}catch(e){}}
 $('snd').onclick=()=>{sound=!sound;$('snd').textContent=sound?'SOUND ON':'SOUND OFF';$('snd').className=sound?'':'off';beep(660,.12)};
 let ws;function conn(){ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws');ws.onmessage=e=>{S=JSON.parse(e.data);render()};ws.onclose=()=>setTimeout(conn,1500)}conn();
-$('tog').onclick=()=>ws.send('toggle');
-function render(){const s=S,g=s.sig,d=g.dir||0,st=s.stats;if(eq0===null)eq0=s.equity;const pl=s.equity-eq0,sw=Math.floor(Date.now()/1100)%6;
+$('tog').onclick=()=>ws.send('toggle');$('symsel').onchange=e=>ws.send('sym:'+e.target.value);$('modesel').onchange=e=>ws.send('mode:'+e.target.value);
+function render(){const s=S,g=s.sig,d=g.dir||0,st=s.stats;const key=s.symbol+'|'+s.smode;if(curSym!==key){curSym=key;$('modesel').value=s.smode;eq0=null;hist=[];floats=[];lastEv=0;const ss=$('symsel');if(!ss.options.length)ss.innerHTML=s.symbols.map(k=>`<option>${k}</option>`).join('');ss.value=s.symbol}if(eq0===null)eq0=s.equity;const pl=s.equity-eq0,sw=Math.floor(Date.now()/1100)%6;
  hist.push({b:g.buy||0,s:g.sell||0,d,sc:g.score||0});if(hist.length>48)hist.shift();
- $('sym').textContent=s.symbol;$('px').textContent=f2(s.price);$('px2').textContent='$'+f2(s.price);$('eq').textContent='$'+f2(s.equity);$('dd').textContent=s.dd+'%';$('clk').textContent=s.time.slice(11,19)+' UTC';$('mode').textContent=s.mode+' · ACCOUNT';
- $('tog').textContent=s.enabled?'SWARM ONLINE':'SWARM PAUSED';$('tog').className=s.enabled?'':'off';$('halt').textContent=s.halt;
- $('pn').textContent='$'+f2(s.equity);$('pn').className='big '+(pl>=0?'up':'dn');$('pns').innerHTML=`${pl>=0?'▲':'▼'} ${f2(Math.abs(pl))} session · ${st.n} exits · WR ${st.wr}% · PF ${st.pf} · MAXDD ${st.maxdd}%`;
- $('strip').innerHTML=`<span class="live">● SIX AGENTS LIVE</span><span>HOLDER <b>${s.agents[sw].name}</b></span><span>HANDOFFS/MIN <b>${60+s.logs.length}</b></span><span>MODEL SCORE <b>${g.score||0}</b></span><span>EDGE <b class="${g.buy>g.sell?'up':'dn'}">${(g.buy-g.sell>=0?'+':'')+((g.buy||0)-(g.sell||0))}</b></span><span>OPEN <b>${s.positions.length} TICKETS</b></span><span>HUMAN INPUT <b>APPROVALS ONLY</b></span>`;
+ $('px').textContent=pf(s.price);$('px2').textContent=pf(s.price);$('c1t').textContent='◆ '+s.symbol+' · M1 + EMA80';$('eq').textContent='$'+f2(s.equity);$('dd').textContent=s.dd+'%';$('clk').textContent=s.time.slice(11,19)+' UTC';$('mode').textContent=s.mode+' · ACCOUNT';
+ $('tog').textContent=s.enabled?'SWARM ONLINE':'SWARM PAUSED';$('tog').className=s.enabled?'':'off';$('halt').textContent=s.market_open?s.halt:'MARKET CLOSED';
+ $('pn').textContent='$'+f2(s.equity);$('pn').className='big '+(pl>=0?'up':'dn');$('pns').innerHTML=`${pl>=0?'▲ +':'▼ -'}${f2(Math.abs(pl))} accumulated · TODAY ${st.day>=0?'+':''}${st.day}<br>${st.n} scalps · WR ${st.wr}% · PF ${st.pf} · STREAK ${st.streak} · BEST ${st.best} · WORST ${st.worst} · MAXDD ${st.maxdd}%`;
+ $('strip').innerHTML=`<span class="live">● SIX AGENTS LIVE</span><span class="live">${s.src}</span>${s.err?'<span class="dn">DATA ERR '+s.err+'</span>':''}<span>HOLDER <b>${s.agents[sw].name}</b></span><span>HANDOFFS/MIN <b>${60+s.logs.length}</b></span><span>MODEL SCORE <b>${g.score||0}</b></span><span>EDGE <b class="${g.buy>g.sell?'up':'dn'}">${(g.buy-g.sell>=0?'+':'')+((g.buy||0)-(g.sell||0))}</b></span><span>OPEN <b>${s.positions.length} TICKETS</b></span><span>HUMAN INPUT <b>APPROVALS ONLY</b></span>`;
  if(!$('agents').children.length)$('agents').innerHTML=s.agents.map((a,i)=>`<div class="ag" id="a_${a.key}" style="--c:${a.color}"><div class="t"><span>${STEP[i]}</span><span class="bd">IDLE</span></div><div class="n">${svg(a.color,POS[i][2])}${a.name}</div><div class="bar"><i></i></div><p></p></div>`).join('');
  s.agents.forEach((a,i)=>{const e=$('a_'+a.key),now=i==sw||a.age<3;e.querySelector('p').textContent=a.msg;e.classList.toggle('now',now);e.querySelector('.bd').textContent=now?'● NOW':i==(sw+1)%6?'NEXT':'IDLE';e.querySelector('.bar i').style.width=now?'100%':'0'});
- $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier\vert{}\vert{}'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
+ $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier||'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
  $('scb').style.cssText=`width:${Math.min(100,g.score||0)}%;background:${d==1?'var(--g)':d==-1?'var(--r)':'#445'}`;$('es').textContent=g.strength+'/100 · slope '+g.slope_atr+' · dist '+g.dist_atr+' ATR';$('esb').style.cssText=`width:${g.strength}%;background:${g.bias==1?'var(--g)':g.bias==-1?'var(--r)':'#445'}`;
  $('bias').textContent='EMA80 '+(g.bias==1?'BULLISH':g.bias==-1?'BEARISH':'NEUTRAL');$('bias').className=g.bias==1?'up':g.bias==-1?'dn':'';$('bay').textContent=(g.buy>=g.sell?'BUY ':'SELL ')+Math.max(g.buy,g.sell);
- const F=g.facts||{};$('chips').innerHTML=[['D1',F.trend],['H4 MA',F.ma],['H1',F.candle],['OB',F.ob],['FVG',F.fvg]].map(([k,v])=>`<span>${k} ${SG[v||0]}</span>`).join('')+`<span>RSI ${F.rsi??'-'}</span>`+(g.note?`<span class="warn">${g.note}</span>`:'');
- $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';$('tks').innerHTML=s.tickets.slice(0,10).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
+ const F=g.facts||{};$('chips').innerHTML=[[s.tfs[0],F.trend],[s.tfs[1]+' MA',F.ma],[s.tfs[2],F.candle],['OB',F.ob],['FVG',F.fvg]].map(([k,v])=>`<span>${k} ${SG[v||0]}</span>`).join('')+`<span>RSI ${F.rsi??'-'}</span>`+(g.note?`<span class="warn">${g.note}</span>`:'');
+ $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';
+ $('tks').innerHTML=s.tickets.slice(0,14).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
   return `<div class="tk ${t.status}" style="--c:${c}"><div class="t"><span>${DN[t.dir]} #${t.id} · ${t.tier}</span><span class="${t.status=='WIN'||pnl>0?'up':pnl<0?'dn':''}">${t.status=='BLOCKED'?'BLOCKED':t.status+'  '+(pnl>=0?'+':'')+f2(pnl)}</span></div>`+
-  (t.status=='BLOCKED'?`<div class="why">${t.why}</div>`:`<div class="m"><span><b>ENTRY</b>${f2(t.entry)}</span><span><b>SL</b>${f2(t.sl)}</span><span><b>TP</b>${f2(t.tp)}</span><span><b>LOT</b>${t.lot}</span></div><div class="rail"><u style="left:${t.dir==1?pos:100-pos}%"></u></div>`)+
+  (t.status=='BLOCKED'?`<div class="why">${t.why}</div>`:`<div class="m"><span><b>ENTRY</b>${pf(t.entry)}</span><span><b>SL</b>${pf(t.sl)}</span><span><b>TP</b>${pf(t.tp)}</span><span><b>LOT</b>${t.lot}</span></div><div class="rail"><u style="left:${t.dir==1?pos:100-pos}%"></u></div>`)+
   `<div class="k">score ${t.score} · ${t.t.slice(5,16)}</div><div class="tr">${Object.entries(t.trail).map(([k,v])=>k.toUpperCase()+': '+v).join('<br>')}</div></div>`}).join('')||'<div class="k">waiting for the first entry signal…</div>';
  $('log').innerHTML=s.logs.map(l=>`<div><em>${l.t}</em><b style="color:${(s.agents.find(a=>a.key==l.a)||{}).color}">${l.a.toUpperCase()}</b><span class="${l.k}">${l.m}</span></div>`).join('');
- s.events.filter(e=>e.id>lastEv).forEach(e=>{lastEv=e.id;const c=e.type=='close'?(e.pnl>=0?'#2ee6a6':'#ff3b4d'):e.type=='open'?(e.dir==1?'#2ee6a6':'#ff3b4d'):'#ff9f43';floats.push({t:e.type=='open'?'ENTRY '+e.txt:e.txt,c,born:performance.now()});
+ s.events.filter(e=>e.id>lastEv).forEach(e=>{lastEv=e.id;const c=e.type=='close'?(e.pnl>=0?'#2ee6a6':'#ff3b4d'):e.type=='open'?(e.dir==1?'#2ee6a6':'#ff3b4d'):'#ff9f43';floats.push({t:(e.type=='open'?'ENTRY '+e.txt:e.txt).slice(0,24),c,born:performance.now()});
   if(e.type=='open'){e.dir==1?(beep(520,.12),beep(780,.18,.12)):(beep(780,.12),beep(520,.18,.12))}else if(e.type=='close'){e.pnl>=0?(beep(660,.1),beep(880,.1,.1),beep(1320,.25,.2)):beep(200,.4)}else beep(300,.15)});
  const ch=s.chart||{};candles($('c1'),ch.p,ch.e);line($('c2'),[{d:s.eq,c:'#2ee6a6',fill:1}]);bayes($('c3'),g);spec($('c4'))}
-function fit(cv,hh){const r=devicePixelRatio||1,w=cv.clientWidth,h=hh||+cv.getAttribute('height');if(hh)cv.style.height=h+'px';if(cv.width!=w*r||cv.height!=h*r){cv.width=w*r;cv.height=h*r}const x=cv.getContext('2d');x.setTransform(r,0,0,r,0,0);x.clearRect(0,0,w,h);return[x,w,h]}
+function fit(cv,hh){const r=devicePixelRatio||1,w=cv.clientWidth,h=hh||+(cv.dataset.h||(cv.dataset.h=cv.getAttribute('height')));cv.style.height=h+'px';const W=Math.round(w*r),H=Math.round(h*r);if(cv.width!=W||cv.height!=H){cv.width=W;cv.height=H}const x=cv.getContext('2d');x.setTransform(r,0,0,r,0,0);x.clearRect(0,0,w,h);return[x,w,h]}
 function line(cv,ss){ss=ss.filter(s=>s.d&&s.d.length>1);if(!ss.length)return;const[x,w,h]=fit(cv),all=ss.flatMap(s=>s.d),lo=Math.min(...all),hi=Math.max(...all),y=v=>h-4-(v-lo)/((hi-lo)||1)*(h-8);
  ss.forEach(s=>{x.beginPath();s.d.forEach((v,i)=>x[i?'lineTo':'moveTo'](i/(s.d.length-1)*w,y(v)));x.strokeStyle=s.c;x.lineWidth=1.5;x.stroke();if(s.fill){x.lineTo(w,h);x.lineTo(0,h);const gr=x.createLinearGradient(0,0,0,h);gr.addColorStop(0,'#2ee6a655');gr.addColorStop(1,'#2ee6a600');x.fillStyle=gr;x.fill()}})}
 function candles(cv,p,e){if(!p||p.length<8)return;const[x,w,h]=fit(cv),n=Math.floor(p.length/4),c=[];for(let i=0;i<n;i++){const a=p.slice(i*4,i*4+4);c.push([a[0],Math.max(...a),Math.min(...a),a[3]])}
@@ -475,7 +482,7 @@ function loop(t){requestAnimationFrame(loop);const w0=hub.clientWidth,[x,w,h]=fi
  if(Rr.length>2){const lo=Math.min(...Rr),hi=Math.max(...Rr);x.save();x.shadowColor='#5eead4';x.shadowBlur=8;x.beginPath();Rr.forEach((v,i)=>x[i?'lineTo':'moveTo'](ox+r+i/(Rr.length-1)*(w*.78-ox-r),oy+(Rr[0]-v)/((hi-lo)||1)*h*.32));x.strokeStyle='#5eead4';x.lineWidth=1.8;x.stroke();x.restore()}
  for(let y=top;y<bot;y+=3){const wd=w*.06*Math.exp(-Math.pow((y-oy)/(h*.17),2))*(.85+.15*Math.sin(ph*2+y*.05));x.fillStyle=y<oy?'rgba(46,230,166,.4)':'rgba(255,59,77,.4)';x.fillRect(aR,y,wd,3)}
  x.fillStyle='#2ee6a6';x.fillRect(aR-1,top,2,oy-top);x.fillStyle='#ff3b4d';x.fillRect(aR-1,oy,2,bot-oy);
- x.fillStyle='#5d6a80';x.fillRect(w*.7,h*.36,1,h*.36);x.fillStyle='#fff';x.font='700 '+(w<600?12:18)+'px system-ui';x.textAlign='left';x.fillText('$'+f2(S.price),6,top-1);x.textAlign='right';x.fillText((g.score||0)+'/100',w-6,top-1);
+ x.fillStyle='#5d6a80';x.fillRect(w*.7,h*.36,1,h*.36);x.fillStyle='#fff';x.font='700 '+(w<600?12:18)+'px system-ui';x.textAlign='left';x.fillText(pf(S.price),6,top-1);x.textAlign='right';x.fillText((g.score||0)+'/100',w-6,top-1);
  const P=S.agents.map((a,i)=>({a,i,cx:POS[i][0]*w,cy:POS[i][1]*h,hot:a.age<3||i==sw}));
  P.forEach(q=>{const mx=(q.cx+ox)/2,my=(q.cy+oy)/2+(q.cy<oy?-1:1)*h*.1;q.m=[mx,my];x.strokeStyle=q.a.color+(q.hot?'88':'28');x.lineWidth=q.hot?1.3:.8;x.beginPath();x.moveTo(q.cx,q.cy);x.quadraticCurveTo(mx,my,ox,oy);x.stroke();if(q.hot&&Math.random()<.4)pk.push({q,u:0,s:.012+Math.random()*.014})});
  pk=pk.filter(k=>k.u<1);pk.forEach(k=>{k.u+=k.s;const q=k.q,u=k.u,px=(1-u)**2*q.cx+2*(1-u)*u*q.m[0]+u*u*ox,py=(1-u)**2*q.cy+2*(1-u)*u*q.m[1]+u*u*oy;x.fillStyle=q.a.color;x.shadowColor=q.a.color;x.shadowBlur=8;x.beginPath();x.arc(px,py,2.2,0,7);x.fill();x.shadowBlur=0});
@@ -493,44 +500,61 @@ requestAnimationFrame(loop);
 
 # ---------------------------------------------------------------- web server
 def build(cfg):
-    from fastapi import FastAPI, WebSocket
-    from fastapi.responses import HTMLResponse
-    eng, app = Engine(cfg), FastAPI()
+    from fastapi import FastAPI, Request, WebSocket
+    from fastapi.responses import HTMLResponse, Response
+    try: eng = Engine(cfg)
+    except Exception as ex:
+        print("!! real data unavailable, using simulation:", ex); eng = Engine(replace(cfg, data="sim"))
+        eng.logs.appendleft(dict(t="--", a="closer", m=f"data fetch failed -> SIMULATION ({ex})", k="loss"))
+    hold, app = {"e": eng}, FastAPI()
     def loop():
         while True:
-            try: eng.tick()
-            except Exception as ex: eng.logs.appendleft(dict(t="--", a="closer", m=f"ERROR {ex!r}", k="loss"))
+            e = hold["e"]
+            try: e.tick()
+            except Exception as ex: e.logs.appendleft(dict(t="--", a="closer", m=f"ERROR {ex!r}", k="loss"))
             time.sleep(1)
     threading.Thread(target=loop, daemon=True).start()
+    pw = os.environ.get("DESK_PASSWORD", ""); tok = hashlib.sha256((pw+"smc-desk").encode()).hexdigest()
+    @app.get("/health")
+    def health(): return {"ok": True, "symbol": hold["e"].c.symbol}
     @app.get("/")
-    def index(): return HTMLResponse(PAGE)
+    def index(req: Request):
+        if pw and req.cookies.get("desk") != tok:        # optional password (set DESK_PASSWORD) - any username
+            try: ok = base64.b64decode(req.headers.get("authorization", "")[6:]).decode().split(":", 1)[1] == pw
+            except Exception: ok = False
+            if not ok: return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="SMC DESK"'})
+        r = HTMLResponse(PAGE)
+        if pw: r.set_cookie("desk", tok, httponly=True, samesite="strict")
+        return r
     @app.websocket("/ws")
     async def ws(w: WebSocket):
+        if pw and w.cookies.get("desk") != tok: await w.close(code=1008); return
         await w.accept()
         async def rx():
             async for m in w.iter_text():
-                if m == "toggle": eng.enabled = not eng.enabled
+                if m == "toggle": hold["e"].enabled = not hold["e"].enabled
+                elif (m.startswith("sym:") and m[4:] in YMAP) or m in ("mode:scalp", "mode:swing"):
+                    kw = dict(symbol=m[4:], data="yahoo") if m.startswith("sym:") else dict(mode=m[5:])
+                    try: hold["e"] = await asyncio.get_running_loop().run_in_executor(None, lambda: Engine(replace(hold["e"].base, **kw)))
+                    except Exception as ex: hold["e"].logs.appendleft(dict(t="--", a="closer", m=f"switch failed: {ex}", k="loss"))
         task = asyncio.create_task(rx())
         try:
             while True:
-                await w.send_text(json.dumps(eng.snapshot(), default=lambda o: float(o) if isinstance(o, (np.floating, np.integer)) else str(o)))
+                await w.send_text(json.dumps(hold["e"].snapshot(), default=lambda o: float(o) if isinstance(o, (np.floating, np.integer)) else str(o)))
                 await asyncio.sleep(1)
         except Exception: pass
         finally: task.cancel()
     return app
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--live", action="store_true")
-    ap.add_argument("--binance", action="store_true")
-    ap.add_argument("--symbol", default="BTCUSDT")
-    ap.add_argument("--port", type=int, default=8000)
-    a, _ = ap.parse_known_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--live", action="store_true"); ap.add_argument("--symbol", default="BTCUSD")
+    ap.add_argument("--data", default="yahoo", choices=["yahoo", "sim"]); ap.add_argument("--mode", default="scalp", choices=["scalp", "swing"]); ap.add_argument("--port", type=int, default=8000); a, _ = ap.parse_known_args()
     import uvicorn, socket
-    port = a.port
-    while True:
+    cloud = bool(os.environ.get("PORT"))            # Render / any PaaS sets PORT
+    port = int(os.environ.get("PORT", a.port))
+    while not cloud:                 # locally: skip ports that are already taken
         with socket.socket() as sk:
             if sk.connect_ex(("127.0.0.1", port)) != 0: break
         port += 1
     print(f"\n>>> Open Chrome at:  http://localhost:{port}\n")
-    uvicorn.run(build(Cfg(symbol=a.symbol, live=a.live, binance=a.binance)), host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(build(Cfg(symbol=a.symbol, live=a.live, data=a.data, mode=a.mode)), host="0.0.0.0" if cloud else "127.0.0.1", port=port, log_level="warning")
