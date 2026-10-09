@@ -1,4 +1,4 @@
-pandas
+MetaTrader5; sys_platform == "win32"pandas
 numpy
 requests
 uvicorn[standard]
