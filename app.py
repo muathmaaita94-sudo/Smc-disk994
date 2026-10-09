@@ -1,17 +1,20 @@
-"""SMC DESK - Python port of SMC_ICT_MultiStrategy_EA (EMA80 v2) as a 6-agent swarm."""
-import argparse, asyncio, json, math, threading, time, os
+"""SMC DESK - Python port of SMC_ICT_MultiStrategy_EA (EMA80 v2) as a 6-agent swarm.
+  python app.py                        -> paper mode on simulated data (works anywhere)
+  python app.py --live --symbol BTCUSDm -> real MetaTrader5 terminal (Windows)
+Then open http://localhost:8000"""
+import argparse, asyncio, json, math, threading, time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np, pandas as pd
 
 @dataclass
-class Cfg:  
+class Cfg:  # same inputs as the EA (distances in points, converted with feed.point)
     symbol: str = "BTCUSDm"; live: bool = False; magic: int = 20260719; sim_speed: int = 5
     risk_pct: float = 0.5; max_total_risk: float = 1.5; max_trades: int = 2
     min_dist_pts: float = 800; max_spread_pts: float = 300
     atr_n: int = 14; atr_sl: float = 2.5; rr: float = 3.5
-    p1: tuple = (50, 30); p2: tuple = (75, 30)          
+    p1: tuple = (50, 30); p2: tuple = (75, 30)          # (% of TP distance, % of volume)
     trail_start: float = 50; trail_atr: float = 2.0; be_trigger: float = 30; be_off_pts: float = 20
     min_score: int = 70; full_score: int = 85; light_score: int = 55; light_lot: float = 0.5; light_rr: float = 0.6
     sr_lookback: int = 100; sr_zone_pts: float = 50
@@ -20,6 +23,7 @@ class Cfg:
     daily_limit: float = 3.0; max_dd: float = 10.0; emergency_dd: float = 15.0; dd_cooldown_h: int = 24
     recovery_losses: int = 3; recovery_mult: float = 0.5; hours: tuple = (0, 24)
 
+# ---------------------------------------------------------------- indicators
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
     d = s.diff(); u = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
@@ -28,6 +32,7 @@ def atr(df, n=14):
     pc = df.close.shift(); tr = pd.concat([df.high-df.low, (df.high-pc).abs(), (df.low-pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
+# ---------------------------------------------------------------- data feeds
 class SimFeed:
     point, contract, vmin, vmax, vstep = 0.01, 1.0, 0.01, 10.0, 0.01
     def __init__(s, n=90000):
@@ -55,7 +60,7 @@ class MT5Feed:
         if not m.initialize(): raise RuntimeError(f"MT5 init failed: {m.last_error()}")
         m.symbol_select(sym, True); i = m.symbol_info(sym)
         s.point, s.vmin, s.vmax, s.vstep = i.point, i.volume_min, i.volume_max, i.volume_step
-        s.contract = i.trade_tick_value/i.trade_tick_size       
+        s.contract = i.trade_tick_value/i.trade_tick_size       # money per 1.0 price move per 1 lot
     def step(s): pass
     def rates(s, tf, n):
         m = s.m; c = {"M1": m.TIMEFRAME_M1, "H1": m.TIMEFRAME_H1, "H4": m.TIMEFRAME_H4, "D1": m.TIMEFRAME_D1}[tf]
@@ -64,6 +69,7 @@ class MT5Feed:
     def spread(s): return s.m.symbol_info(s.sym).spread
     def now(s): return pd.Timestamp(s.m.symbol_info_tick(s.sym).time, unit="s")
 
+# ---------------------------------------------------------------- brokers (same interface)
 class Paper:
     def __init__(s, feed, bal=10000.0): s.f, s.bal, s.pos, s.n = feed, bal, {}, 0
     def balance(s): return s.bal
@@ -108,16 +114,17 @@ class Live:
         s.m.order_send(dict(action=s.m.TRADE_ACTION_SLTP, position=id, symbol=s.f.sym, sl=sl, tp=p["tp"]))
     def close(s, id, vol=None, px=None):
         m = s.m; p = next(p for p in s.positions() if p["id"] == id); b, a = s.f.tick()
-        m.order_send(dict(action=s.m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
+        m.order_send(dict(action=m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
                           magic=s.magic, type=m.ORDER_TYPE_SELL if p["dir"] == 1 else m.ORDER_TYPE_BUY,
                           price=b if p["dir"] == 1 else a, type_filling=m.ORDER_FILLING_IOC))
-    def check_stops(s):       
+    def check_stops(s):       # every exit deal (SL/TP/partial/manual), same as the EA's OnTradeTransaction
         m, out = s.m, []
         for d in m.history_deals_get(s.t0.to_pydatetime(), (pd.Timestamp.now()+pd.Timedelta(days=1)).to_pydatetime()) or []:
             if d.magic == s.magic and d.entry == m.DEAL_ENTRY_OUT and d.ticket not in s.seen:
                 s.seen.add(d.ticket); out.append(dict(id=d.position_id, pnl=round(d.profit+d.swap+d.commission, 2)))
         return out
 
+# ---------------------------------------------------------------- the swarm
 AGENTS = [("spotter", "SPOTTER", "TAPE · D1 / H4 / H1", "#2ee6a6"), ("prior", "PRIOR", "STRUCTURE · S/R · OB · FVG", "#ff9f43"),
           ("edge", "EDGE", "EMA80 BIAS · SCORE", "#ff3ea5"), ("kelly", "KELLY", "SIZING · SL/TP · RISK", "#a45cff"),
           ("taker", "TAKER", "FILTERS · EXECUTION", "#3b6bff"), ("closer", "CLOSER", "MANAGE · LIMITS", "#ff3b3b")]
@@ -134,6 +141,7 @@ class Engine:
         s.logs, s.tickets, s.events, s.tk, s.flags, s.eq = deque(maxlen=80), deque(maxlen=40), deque(maxlen=30), {}, {}, deque(maxlen=300)
         s.enabled, s.last_bar, s.ctx, s.halt, s.cool, s.day, s.atr, s.eid, s.losses, s.dd = True, None, {}, "", None, None, 0.0, 0, 0, 0.0
         s.peak, s.day_bal, s.stats = s.br.equity(), s.br.balance(), dict(n=0, w=0, gp=0.0, gl=0.0, maxdd=0.0)
+    # -- helpers
     def say(s, a, msg, log=None, kind="info"):
         a.msg = msg; a.runs += 1
         if log and log != a.last:
@@ -152,6 +160,7 @@ class Engine:
             if rec["id"] not in {p["id"] for p in s.br.positions()}: t["status"] = "WIN" if t["pnl"] >= 0 else "LOSS"
         s.event("close", f"{'WIN' if pnl >= 0 else 'LOSS'} {pnl:+,.0f}$", pnl=pnl)
         s.say(s.ag["closer"], f"exit #{rec['id']} {pnl:+.2f}$ {why}", f"exit #{rec['id']} {pnl:+,.2f}$ {why}", "win" if pnl >= 0 else "loss")
+    # -- one decision cycle: Closer(risk) -> Spotter -> Prior -> Edge -> Kelly -> Taker -> Closer(manage)
     def tick(s):
         for _ in range(1 if s.c.live else s.c.sim_speed): s.feed.step()
         s.ctx = dict(b=0, s=0, facts={})
@@ -173,7 +182,7 @@ class Engine:
 
     def prior(s):
         c, x = s.c, s.ctx; h1 = x["h1"]; a = float(atr(h1, c.atr_n).iloc[-2]); s.atr = x["atr"] = a
-        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))   
+        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))   # index k = shift k
         px, z = cl[1], c.sr_zone_pts*s.feed.point
         res, sup = h[1:c.sr_lookback+1].max(), l[1:c.sr_lookback+1].min(); ob = fvg = 0
         for i in range(2, 20):
@@ -374,11 +383,12 @@ function render(){const s=S,g=s.sig,d=g.dir||0,st=s.stats;if(eq0===null)eq0=s.eq
  $('strip').innerHTML=`<span class="live">● SIX AGENTS LIVE</span><span>HOLDER <b>${s.agents[sw].name}</b></span><span>HANDOFFS/MIN <b>${60+s.logs.length}</b></span><span>MODEL SCORE <b>${g.score||0}</b></span><span>EDGE <b class="${g.buy>g.sell?'up':'dn'}">${(g.buy-g.sell>=0?'+':'')+((g.buy||0)-(g.sell||0))}</b></span><span>OPEN <b>${s.positions.length} TICKETS</b></span><span>HUMAN INPUT <b>APPROVALS ONLY</b></span>`;
  if(!$('agents').children.length)$('agents').innerHTML=s.agents.map((a,i)=>`<div class="ag" id="a_${a.key}" style="--c:${a.color}"><div class="t"><span>${STEP[i]}</span><span class="bd">IDLE</span></div><div class="n">${svg(a.color,POS[i][2])}${a.name}</div><div class="bar"><i></i></div><p></p></div>`).join('');
  s.agents.forEach((a,i)=>{const e=$('a_'+a.key),now=i==sw||a.age<3;e.querySelector('p').textContent=a.msg;e.classList.toggle('now',now);e.querySelector('.bd').textContent=now?'● NOW':i==(sw+1)%6?'NEXT':'IDLE';e.querySelector('.bar i').style.width=now?'100%':'0'});
- $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier\vert{}\vert{}'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
+ $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier||'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
  $('scb').style.cssText=`width:${Math.min(100,g.score||0)}%;background:${d==1?'var(--g)':d==-1?'var(--r)':'#445'}`;$('es').textContent=g.strength+'/100 · slope '+g.slope_atr+' · dist '+g.dist_atr+' ATR';$('esb').style.cssText=`width:${g.strength}%;background:${g.bias==1?'var(--g)':g.bias==-1?'var(--r)':'#445'}`;
  $('bias').textContent='EMA80 '+(g.bias==1?'BULLISH':g.bias==-1?'BEARISH':'NEUTRAL');$('bias').className=g.bias==1?'up':g.bias==-1?'dn':'';$('bay').textContent=(g.buy>=g.sell?'BUY ':'SELL ')+Math.max(g.buy,g.sell);
  const F=g.facts||{};$('chips').innerHTML=[['D1',F.trend],['H4 MA',F.ma],['H1',F.candle],['OB',F.ob],['FVG',F.fvg]].map(([k,v])=>`<span>${k} ${SG[v||0]}</span>`).join('')+`<span>RSI ${F.rsi??'-'}</span>`+(g.note?`<span class="warn">${g.note}</span>`:'');
- $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';$('tks').innerHTML=s.tickets.slice(0,10).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
+ $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';
+ $('tks').innerHTML=s.tickets.slice(0,10).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
   return `<div class="tk ${t.status}" style="--c:${c}"><div class="t"><span>${DN[t.dir]} #${t.id} · ${t.tier}</span><span class="${t.status=='WIN'||pnl>0?'up':pnl<0?'dn':''}">${t.status=='BLOCKED'?'BLOCKED':t.status+'  '+(pnl>=0?'+':'')+f2(pnl)}</span></div>`+
   (t.status=='BLOCKED'?`<div class="why">${t.why}</div>`:`<div class="m"><span><b>ENTRY</b>${f2(t.entry)}</span><span><b>SL</b>${f2(t.sl)}</span><span><b>TP</b>${f2(t.tp)}</span><span><b>LOT</b>${t.lot}</span></div><div class="rail"><u style="left:${t.dir==1?pos:100-pos}%"></u></div>`)+
   `<div class="k">score ${t.score} · ${t.t.slice(5,16)}</div><div class="tr">${Object.entries(t.trail).map(([k,v])=>k.toUpperCase()+': '+v).join('<br>')}</div></div>`}).join('')||'<div class="k">waiting for the first entry signal…</div>';
@@ -396,6 +406,7 @@ function candles(cv,p,e){if(!p||p.length<8)return;const[x,w,h]=fit(cv),n=Math.fl
 function bayes(cv,g){const[x,w,h]=fit(cv),G=(m,sg,col,al)=>{x.beginPath();for(let i=0;i<=w;i+=3){const u=i/w,v=Math.exp(-Math.pow((u-m)/sg,2)/2);x[i?'lineTo':'moveTo'](i,h-6-v*(h-18))}x.strokeStyle=col;x.lineWidth=1.6;x.stroke();x.lineTo(w,h);x.lineTo(0,h);x.fillStyle=col+al;x.fill()};
  const st=(g.strength||0)/100;G((g.sell||0)/100,.14-.05*st,'#ff3b4d','33');G((g.buy||0)/100,.14-.05*st,'#2ee6a6','33');x.fillStyle='#5d6a80';x.font='8px ui-monospace';x.fillText('SELL '+(g.sell||0),4,10);x.textAlign='right';x.fillText('BUY '+(g.buy||0),w-4,10)}
 function spec(cv){const[x,w,h]=fit(cv),n=48,R=14,cw=w/n,ch=h/R;hist.forEach((q,i)=>{for(let r=0;r<R;r++){const c=(r+.5)/R*100,v=Math.max(0,1-Math.abs(c-q.sc)/22);if(v>.05){x.fillStyle=q.d>=0&&q.b>=q.s?`rgba(46,230,166,${v})`:`rgba(255,159,67,${v})`;x.fillRect((n-hist.length+i)*cw,h-(r+1)*ch,cw-1,ch-1)}}})}
+// ---------------- THE LENS: orderbook | tape fan | orb | futures | probability, six agents around
 const hub=$('hub'),noise=[],fan=[];for(let i=0;i<280;i++)noise.push([Math.random(),Math.random()*2-1,Math.random()]);for(let i=0;i<70;i++)fan.push([Math.random(),Math.random()*6.28]);
 function loop(t){requestAnimationFrame(loop);const w0=hub.clientWidth,[x,w,h]=fit(hub,w0<600?310:Math.min(560,w0*.5));x.fillStyle='#020306';x.fillRect(0,0,w,h);if(!S)return;
  const g=S.sig||{},d=g.dir||0,ox=w*.5,oy=h*.5,r=Math.min(w*.07,h*.17)*(1+.02*Math.sin(t/500)),aL=w*.16,aR=w*.84,top=h*.09,bot=h*.91,ph=t/1000,sw=Math.floor(t/1100)%6,p=(S.chart&&S.chart.p)||[],ph1=ph*1.7;
@@ -424,6 +435,7 @@ requestAnimationFrame(loop);
 </script></body></html>
 """
 
+# ---------------------------------------------------------------- web server
 def build(cfg):
     from fastapi import FastAPI, WebSocket
     from fastapi.responses import HTMLResponse
@@ -454,8 +466,11 @@ def build(cfg):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--live", action="store_true"); ap.add_argument("--symbol", default="BTCUSDm")
     ap.add_argument("--port", type=int, default=8000); a, _ = ap.parse_known_args()
-    import uvicorn
-    # قراءة البورت المخصص من Render تلقائياً أو الاعتماد على 10000 كقيمة افتراضية
-    port = int(os.environ.get("PORT", a.port))
-    print(f"\n>>> Running server on port: {port}\n")
+    import uvicorn, socket
+    port = a.port
+    while True:                      # skip ports that are already taken
+        with socket.socket() as sk:
+            if sk.connect_ex(("127.0.0.1", port)) != 0: break
+        port += 1
+    print(f"\n>>> Open Chrome at:  http://localhost:{port}\n")
     uvicorn.run(build(Cfg(symbol=a.symbol, live=a.live)), host="0.0.0.0", port=port, log_level="warning")
