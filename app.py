@@ -1,16 +1,18 @@
 """SMC DESK - Python port of SMC_ICT_MultiStrategy_EA (EMA80 v2) as a 6-agent swarm.
   python app.py                        -> paper mode on simulated data (works anywhere)
   python app.py --live --symbol BTCUSDm -> real MetaTrader5 terminal (Windows)
+  python app.py --binance --symbol BTCUSDT -> real Binance data (works anywhere)
 Then open http://localhost:8000"""
 import argparse, asyncio, json, math, threading, time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np, pandas as pd
+import requests
 
 @dataclass
 class Cfg:  # same inputs as the EA (distances in points, converted with feed.point)
-    symbol: str = "BTCUSDm"; live: bool = False; magic: int = 20260719; sim_speed: int = 5
+    symbol: str = "BTCUSDT"; live: bool = False; binance: bool = False; magic: int = 20260719; sim_speed: int = 5
     risk_pct: float = 0.5; max_total_risk: float = 1.5; max_trades: int = 2
     min_dist_pts: float = 800; max_spread_pts: float = 300
     atr_n: int = 14; atr_sl: float = 2.5; rr: float = 3.5
@@ -69,6 +71,54 @@ class MT5Feed:
     def spread(s): return s.m.symbol_info(s.sym).spread
     def now(s): return pd.Timestamp(s.m.symbol_info_tick(s.sym).time, unit="s")
 
+class BinanceFeed:
+    point, contract, vmin, vmax, vstep = 0.01, 1.0, 0.001, 100.0, 0.001
+    def __init__(s, symbol="BTCUSDT"):
+        s.sym = symbol.upper()
+        s._update_rates()
+    def _update_rates(s):
+        url = f"https://api.binance.com/api/v3/klines?symbol={s.sym}&interval=1m&limit=500"
+        res = requests.get(url).json()
+        df = pd.DataFrame(res, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base', 'taker_buy_quote', 'ignore'
+        ])
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+        s.df = df.set_index('time')
+    def step(s):
+        try:
+            s._update_rates()
+        except Exception:
+            pass
+    def rates(s, tf, n):
+        interval_map = {"M1": "1m", "H1": "1h", "H4": "4h", "D1": "1d"}
+        if tf != "M1":
+            try:
+                url = f"https://api.binance.com/api/v3/klines?symbol={s.sym}&interval={interval_map.get(tf, '1h')}&limit={n}"
+                res = requests.get(url).json()
+                df = pd.DataFrame(res, columns=['time', 'open', 'high', 'low', 'close', 'volume', *_[:6]])
+                df['time'] = pd.to_datetime(df['time'], unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df.set_index('time').tail(n)
+            except Exception:
+                pass
+        return s.df.tail(n)
+    def tick(s):
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/price?symbol={s.sym}"
+            res = requests.get(url).json()
+            px = float(res['price'])
+            return px, px + 0.5
+        except Exception:
+            px = float(s.df.close.iloc[-1])
+            return px, px + 0.5
+    def spread(s): return 10
+    def now(s): return s.df.index[-1]
+
 # ---------------------------------------------------------------- brokers (same interface)
 class Paper:
     def __init__(s, feed, bal=10000.0): s.f, s.bal, s.pos, s.n = feed, bal, {}, 0
@@ -114,10 +164,10 @@ class Live:
         s.m.order_send(dict(action=s.m.TRADE_ACTION_SLTP, position=id, symbol=s.f.sym, sl=sl, tp=p["tp"]))
     def close(s, id, vol=None, px=None):
         m = s.m; p = next(p for p in s.positions() if p["id"] == id); b, a = s.f.tick()
-        m.order_send(dict(action=m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
-                          magic=s.magic, type=m.ORDER_TYPE_SELL if p["dir"] == 1 else m.ORDER_TYPE_BUY,
-                          price=b if p["dir"] == 1 else a, type_filling=m.ORDER_FILLING_IOC))
-    def check_stops(s):       # every exit deal (SL/TP/partial/manual), same as the EA's OnTradeTransaction
+        m.order_send(dict(action=s.m.TRADE_ACTION_DEAL, symbol=s.f.sym, position=id, volume=vol or p["vol"], deviation=30,
+                          magic=s.magic, type=s.m.ORDER_TYPE_SELL if p["dir"] == 1 else s.m.ORDER_TYPE_BUY,
+                          price=b if p["dir"] == 1 else a, type_filling=s.m.ORDER_FILLING_IOC))
+    def check_stops(s):
         m, out = s.m, []
         for d in m.history_deals_get(s.t0.to_pydatetime(), (pd.Timestamp.now()+pd.Timedelta(days=1)).to_pydatetime()) or []:
             if d.magic == s.magic and d.entry == m.DEAL_ENTRY_OUT and d.ticket not in s.seen:
@@ -135,8 +185,16 @@ class Agent:
 
 class Engine:
     def __init__(s, cfg):
-        s.c = cfg; s.feed = MT5Feed(cfg.symbol) if cfg.live else SimFeed()
-        s.br = Live(s.feed, cfg.magic) if cfg.live else Paper(s.feed)
+        s.c = cfg
+        if cfg.binance:
+            s.feed = BinanceFeed(cfg.symbol)
+            s.br = Paper(s.feed)
+        elif cfg.live:
+            s.feed = MT5Feed(cfg.symbol)
+            s.br = Live(s.feed, cfg.magic)
+        else:
+            s.feed = SimFeed()
+            s.br = Paper(s.feed)
         s.ag = {k: Agent(k, n, r, col) for k, n, r, col in AGENTS}
         s.logs, s.tickets, s.events, s.tk, s.flags, s.eq = deque(maxlen=80), deque(maxlen=40), deque(maxlen=30), {}, {}, deque(maxlen=300)
         s.enabled, s.last_bar, s.ctx, s.halt, s.cool, s.day, s.atr, s.eid, s.losses, s.dd = True, None, {}, "", None, None, 0.0, 0, 0, 0.0
@@ -160,9 +218,8 @@ class Engine:
             if rec["id"] not in {p["id"] for p in s.br.positions()}: t["status"] = "WIN" if t["pnl"] >= 0 else "LOSS"
         s.event("close", f"{'WIN' if pnl >= 0 else 'LOSS'} {pnl:+,.0f}$", pnl=pnl)
         s.say(s.ag["closer"], f"exit #{rec['id']} {pnl:+.2f}$ {why}", f"exit #{rec['id']} {pnl:+,.2f}$ {why}", "win" if pnl >= 0 else "loss")
-    # -- one decision cycle: Closer(risk) -> Spotter -> Prior -> Edge -> Kelly -> Taker -> Closer(manage)
     def tick(s):
-        for _ in range(1 if s.c.live else s.c.sim_speed): s.feed.step()
+        for _ in range(1 if (s.c.live or s.c.binance) else s.c.sim_speed): s.feed.step()
         s.ctx = dict(b=0, s=0, facts={})
         for r in s.br.check_stops(): s.on_close(r, "SL/TP")
         s.closer_risk(); s.closer_manage()
@@ -182,7 +239,7 @@ class Engine:
 
     def prior(s):
         c, x = s.c, s.ctx; h1 = x["h1"]; a = float(atr(h1, c.atr_n).iloc[-2]); s.atr = x["atr"] = a
-        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))   # index k = shift k
+        o, h, l, cl = (h1[k].values[::-1] for k in ("open", "high", "low", "close"))
         px, z = cl[1], c.sr_zone_pts*s.feed.point
         res, sup = h[1:c.sr_lookback+1].max(), l[1:c.sr_lookback+1].min(); ob = fvg = 0
         for i in range(2, 20):
@@ -298,7 +355,7 @@ class Engine:
         for t in s.tickets:
             if t["status"] == "OPEN" and t["id"] in pnl: t["live"] = round(pnl[t["id"]], 2)
         b, a = s.feed.tick(); eq = s.br.equity()
-        return dict(mode="LIVE" if s.c.live else "PAPER", symbol=s.c.symbol if s.c.live else "BTC/USD·SIM", time=str(s.feed.now()), price=b,
+        return dict(mode="LIVE" if (s.c.live or s.c.binance) else "PAPER", symbol=s.c.symbol, time=str(s.feed.now()), price=b,
                     enabled=s.enabled, halt=s.halt, equity=round(eq, 2), balance=round(s.br.balance(), 2), dd=round(s.dd, 2),
                     agents=[dict(key=a.key, name=a.name, role=a.role, color=a.color, msg=a.msg, age=round(now-a.pulse, 1)) for a in s.ag.values()],
                     sig={k: x.get(k) for k in ("dir", "score", "tier", "bias", "strength", "note", "buy", "sell", "slope_atr", "dist_atr", "facts", "plan")},
@@ -383,12 +440,11 @@ function render(){const s=S,g=s.sig,d=g.dir||0,st=s.stats;if(eq0===null)eq0=s.eq
  $('strip').innerHTML=`<span class="live">● SIX AGENTS LIVE</span><span>HOLDER <b>${s.agents[sw].name}</b></span><span>HANDOFFS/MIN <b>${60+s.logs.length}</b></span><span>MODEL SCORE <b>${g.score||0}</b></span><span>EDGE <b class="${g.buy>g.sell?'up':'dn'}">${(g.buy-g.sell>=0?'+':'')+((g.buy||0)-(g.sell||0))}</b></span><span>OPEN <b>${s.positions.length} TICKETS</b></span><span>HUMAN INPUT <b>APPROVALS ONLY</b></span>`;
  if(!$('agents').children.length)$('agents').innerHTML=s.agents.map((a,i)=>`<div class="ag" id="a_${a.key}" style="--c:${a.color}"><div class="t"><span>${STEP[i]}</span><span class="bd">IDLE</span></div><div class="n">${svg(a.color,POS[i][2])}${a.name}</div><div class="bar"><i></i></div><p></p></div>`).join('');
  s.agents.forEach((a,i)=>{const e=$('a_'+a.key),now=i==sw||a.age<3;e.querySelector('p').textContent=a.msg;e.classList.toggle('now',now);e.querySelector('.bd').textContent=now?'● NOW':i==(sw+1)%6?'NEXT':'IDLE';e.querySelector('.bar i').style.width=now?'100%':'0'});
- $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier||'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
+ $('sig').textContent=d?DN[d]+'  '+g.score:'NO SIGNAL';$('sig').style.color=d==1?'var(--g)':d==-1?'var(--r)':'var(--mut)';$('tier').textContent=g.tier\vert{}\vert{}'';$('sc').textContent=g.score+'/100 (buy '+g.buy+' · sell '+g.sell+')';
  $('scb').style.cssText=`width:${Math.min(100,g.score||0)}%;background:${d==1?'var(--g)':d==-1?'var(--r)':'#445'}`;$('es').textContent=g.strength+'/100 · slope '+g.slope_atr+' · dist '+g.dist_atr+' ATR';$('esb').style.cssText=`width:${g.strength}%;background:${g.bias==1?'var(--g)':g.bias==-1?'var(--r)':'#445'}`;
  $('bias').textContent='EMA80 '+(g.bias==1?'BULLISH':g.bias==-1?'BEARISH':'NEUTRAL');$('bias').className=g.bias==1?'up':g.bias==-1?'dn':'';$('bay').textContent=(g.buy>=g.sell?'BUY ':'SELL ')+Math.max(g.buy,g.sell);
  const F=g.facts||{};$('chips').innerHTML=[['D1',F.trend],['H4 MA',F.ma],['H1',F.candle],['OB',F.ob],['FVG',F.fvg]].map(([k,v])=>`<span>${k} ${SG[v||0]}</span>`).join('')+`<span>RSI ${F.rsi??'-'}</span>`+(g.note?`<span class="warn">${g.note}</span>`:'');
- $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';
- $('tks').innerHTML=s.tickets.slice(0,10).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
+ $('st').textContent=`$${f2(s.balance)}`;$('nt').textContent=s.positions.length+' open';$('tks').innerHTML=s.tickets.slice(0,10).map(t=>{const c=t.status=='BLOCKED'?'#ff9f43':t.dir==1?'#2ee6a6':'#ff3b4d',pnl=t.status=='OPEN'?(t.live??0):t.pnl,pos=t.status=='OPEN'&&t.sl?Math.max(0,Math.min(100,(s.price-t.sl)/(t.tp-t.sl)*100)):50;
   return `<div class="tk ${t.status}" style="--c:${c}"><div class="t"><span>${DN[t.dir]} #${t.id} · ${t.tier}</span><span class="${t.status=='WIN'||pnl>0?'up':pnl<0?'dn':''}">${t.status=='BLOCKED'?'BLOCKED':t.status+'  '+(pnl>=0?'+':'')+f2(pnl)}</span></div>`+
   (t.status=='BLOCKED'?`<div class="why">${t.why}</div>`:`<div class="m"><span><b>ENTRY</b>${f2(t.entry)}</span><span><b>SL</b>${f2(t.sl)}</span><span><b>TP</b>${f2(t.tp)}</span><span><b>LOT</b>${t.lot}</span></div><div class="rail"><u style="left:${t.dir==1?pos:100-pos}%"></u></div>`)+
   `<div class="k">score ${t.score} · ${t.t.slice(5,16)}</div><div class="tr">${Object.entries(t.trail).map(([k,v])=>k.toUpperCase()+': '+v).join('<br>')}</div></div>`}).join('')||'<div class="k">waiting for the first entry signal…</div>';
@@ -464,13 +520,17 @@ def build(cfg):
     return app
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--live", action="store_true"); ap.add_argument("--symbol", default="BTCUSDm")
-    ap.add_argument("--port", type=int, default=8000); a, _ = ap.parse_known_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--binance", action="store_true")
+    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--port", type=int, default=8000)
+    a, _ = ap.parse_known_args()
     import uvicorn, socket
     port = a.port
-    while True:                      # skip ports that are already taken
+    while True:
         with socket.socket() as sk:
             if sk.connect_ex(("127.0.0.1", port)) != 0: break
         port += 1
     print(f"\n>>> Open Chrome at:  http://localhost:{port}\n")
-    uvicorn.run(build(Cfg(symbol=a.symbol, live=a.live)), host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(build(Cfg(symbol=a.symbol, live=a.live, binance=a.binance)), host="0.0.0.0", port=port, log_level="warning")
